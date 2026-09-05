@@ -299,10 +299,11 @@ class GaussianDiffusion:
         eps_base_lat = F.avg_pool2d(eps_base, kernel_size=self.sf, stride=self.sf)
         eps_detail_lat = F.avg_pool2d(eps_detail, kernel_size=self.sf)
         # 同步计算和训练完全一致的wt
-        ratio = t.float() / self.num_timesteps
-        wt = torch.sigmoid(2 - 4 * ratio).view(-1,1,1,1)
+        # ratio = t.float() / self.num_timesteps
+        # wt = torch.sigmoid(2 - 4 * ratio).view(-1, 1, 1, 1)
         # 时序加权融合两路潜噪声
-        model_output_lat = wt * eps_detail_lat + (1 - wt) * eps_base_lat
+        # model_output_lat = eps_base_lat + wt * eps_detail_lat
+        model_output_lat = eps_base_lat + eps_detail_lat
         model_output = model_output_lat
         model_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
         model_log_variance = _extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
@@ -419,16 +420,11 @@ class GaussianDiffusion:
                 # 获取原始LR图像
                 raw_lr = model_kwargs["raw_lr_image"]
                 # LR上采样到HR尺寸
-                raw_lr_upsampled = F.interpolate(raw_lr, scale_factor=self.sf, mode="bicubic", align_corners=False)
-                # 编码到潜空间
-                raw_lr_lat = self.encode_first_stage(raw_lr_upsampled)
-                # 计算时序混合比例p(t)
                 p = self.calc_p(t)
-                # 构建混合图
-                mix_lat = p * x + (1 - p) * raw_lr_lat
-                # 更新权重
-                wmap, _ = weight_manager.update_weight(mix_lat, smooth_coeff, is_train=False)
-                weight_manager.current_weight = wmap
+                raw_lr_upsampled = F.interpolate(raw_lr, scale_factor=self.sf, mode="bicubic", align_corners=False)
+                x_t_rgb = F.pixel_shuffle(x_t, self.sf)
+                mix_rgb = p * x_t_rgb + (1 - p) * raw_lr_upsampled
+                wmap, _ = weight_manager.update_weight(mix_rgb, smooth_coeff, is_train=False)
 
         out = self.p_mean_variance(
             model,
@@ -539,7 +535,6 @@ class GaussianDiffusion:
             with torch.no_grad():
                 wmap_init, _ = wm.weight_generator(raw_lr)
             wmap_init = torch.clamp(wmap_init, min=0.3, max=1.8)
-            wmap_init = F.interpolate(wmap_init, size=(64,64), mode="bilinear", align_corners=False)
             wm.current_weight = wmap_init
 
         x_sample = self.prior_sample(y, y_hat, noise, weight_manager=wm)
@@ -610,11 +605,12 @@ class GaussianDiffusion:
         Compute training losses for a single timestep.
         """
         if self.training_iter < 100000:
-            reg_weight = 0.003
-            freq_reg_weight = 0.002  # 稍微降低频域正则强度，减少对像素损失的稀释
+            reg_weight = 0.001  # 🔧 改：从 0.003 降到 0.001
+            # freq_reg_weight 已删除，不再使用
         else:
-            reg_weight = 0.01
-            freq_reg_weight = 0.002  # 全程保持0.002，比原0.005略低，平衡像素和频域分离 
+            reg_weight = 0.001  # 🔧 改：从 0.01 降到 0.001
+            # freq_reg_weight 已删除，不再使用
+    
         if model_kwargs is None:
             model_kwargs = {}
         if loss_extra_kwargs is None:
@@ -625,16 +621,30 @@ class GaussianDiffusion:
         t_tensor = t
         wmap = None
 
-        # 第一步：先编码到潜空间，顺序不能乱
+        # 第一步：先编码到潜空间
         y = self.encode_first_stage(y)
         y_hat = self.encode_first_stage(y_hat)
-        
+    
         x_start = self.encode_first_stage(x_start)
         target = x_start
+    
+        # ========== 🆕 新增：构建双目标（源头彻底解耦）==========
+        # 1. 低频目标：对 target 做平滑（avg_pool + 上采样 = 低通滤波）
+        target_low = F.interpolate(
+            F.avg_pool2d(target, kernel_size=3, stride=1, padding=1),
+            size=target.shape[-2:],
+            mode='bilinear'
+        )  # (B, 48, 64, 64)
+    
+        # 2. 高频目标：残差 = 完整 - 低频
+        target_high = target - target_low  # (B, 48, 64, 64)
+        # ========================================================
+    
         if noise is None:
             noise = torch.randn_like(x_start)
         else:
             noise = self.encode_first_stage(noise)
+    
         if wm is not None and model_kwargs.get("raw_lr_image") is not None:
             with torch.no_grad():
                 wmap_noise, _ = wm.weight_generator(model_kwargs["raw_lr_image"])
@@ -642,71 +652,61 @@ class GaussianDiffusion:
             wmap_noise = F.interpolate(wmap_noise, size=noise.shape[-2:], mode="bilinear", align_corners=False)
             wmap_noise = wmap_noise.repeat(1, noise.size(1), 1, 1)
             noise = noise * (1 + 0.5 * wmap_noise)
+    
         x_t = self.q_sample(x_start, y, y_hat, t, noise=noise)
 
         terms = {}
         if self.loss_type == LossType.MSE or self.loss_type == LossType.WEIGHTED_MSE:
-            # 1. LR缩放到潜空间分辨率，作为UNet条件输入
-            target_hw = x_t.shape[-2:]
-            # 送入UNet：原生LR直接作为条件输入 3,64,64
+            # UNet 前向
             raw_lr = model_kwargs["raw_lr_image"]
-            lq_for_unet = raw_lr  # 原生LR (3,64,64)
+            lq_for_unet = raw_lr
             net_kwargs.pop("lq", None)
-            # 调试：打印关键尺寸
-            eps_base, eps_detail = model(self._scale_input(x_t, t), t, lq=lq_for_unet,** net_kwargs)
+            eps_base, eps_detail = model(self._scale_input(x_t, t), t, lq=lq_for_unet, **net_kwargs)
 
-            # 2. 动态权重图同步改为潜空间尺寸（不再固定大图尺寸）
+            # 动态权重图
             wmap_lat = None
             if wm is not None and t_tensor is not None and lr_bicubic is not None:
                 step_t = t_tensor[0].item()
                 need_update, smooth_coeff = wm.get_update_info(step_t)
-                # 1. 计算时序混合比例p(t)
                 p = self.calc_p(t_tensor)
-                # 2. 时序混合图：mix = p*x_t + (1-p)*原生LR
+                x_t_rgb = F.pixel_shuffle(x_t, self.sf)
                 raw_lr_upsampled = F.interpolate(raw_lr, scale_factor=self.sf, mode="bicubic", align_corners=False)
-                raw_lr_lat = self.encode_first_stage(raw_lr_upsampled)
-                mix_lat = p * x_t + (1 - p) * raw_lr_lat
-                 # 3. 混合图送入权重生成器，不再只用纯LR
+                mix_rgb = p * x_t_rgb + (1 - p) * raw_lr_upsampled
                 if need_update:
-                    wmap, _ = wm.update_weight(mix_lat, smooth_coeff, is_train=True)
+                    wmap, _ = wm.update_weight(mix_rgb, smooth_coeff, is_train=True)
                 else:
                     wmap = wm.current_weight
                 wmap = torch.clamp(wmap, min=0.3, max=1.8)
-                wmap_lat = wmap.repeat(1, self.sf * self.sf * 3, 1, 1)
-                # 权重图扩充到48通道，匹配潜空间eps_base通道数
-            # 3. 分支正则（直接使用潜空间输出，无需转换）
+                wmap_lat = wmap.repeat(1, 48, 1, 1)
+
+            # 降采样到潜空间
             eps_base_lat = F.avg_pool2d(eps_base, kernel_size=self.sf, stride=self.sf)
             eps_detail_lat = F.avg_pool2d(eps_detail, kernel_size=self.sf)
-            # 时变权重：用于 model_output 融合和 loss 加权
-            ratio = t.float() / self.num_timesteps
-            time_weight = torch.sigmoid(2 - 4 * ratio).view(-1,1,1,1)
-            model_output_lat = time_weight * eps_detail_lat + (1 - time_weight) * eps_base_lat
-            reg = torch.mean(torch.abs(eps_base_lat - eps_detail_lat))
-            # 频域分离正则，强制base学低频、detail学高频
-            # 使用反射padding避免边缘信息丢失
-            blur_base = F.avg_pool2d(F.pad(eps_base, (2,2,2,2), mode='reflect'), kernel_size=5, padding=0, stride=1)
-            high_detail = eps_detail - F.avg_pool2d(F.pad(eps_detail, (2,2,2,2), mode='reflect'), kernel_size=5, padding=0, stride=1)
-            freq_reg = torch.mean(torch.abs(blur_base - eps_base) + torch.abs(high_detail - eps_detail))
-            # 4. loss计算使用潜空间target、潜空间eps，删除固定尺寸原图域计算
+        
+            # 时变权重
+            # ratio = t.float() / self.num_timesteps
+            # wt = torch.sigmoid(2 - 4 * ratio).view(-1, 1, 1, 1)
+            # model_output_lat = eps_base_lat + wt * eps_detail_lat
+            model_output_lat = eps_base_lat + eps_detail_lat
+            # ========== 🆕 核心修改：Loss 计算（彻底解耦）==========
+            # Base 只学低频目标 target_low，Detail 只学高频目标 target_high
             if wmap_lat is not None:
-                loss_base = mean_flat((1 - time_weight) * wmap_lat * (target - eps_base_lat) ** 2)
-                loss_detail = mean_flat(time_weight * wmap_lat * (target - eps_detail_lat) ** 2)
-                mse_raw = loss_base + loss_detail
+                loss_base = mean_flat(wmap_lat * (target_low - eps_base_lat) ** 2)
+                loss_detail = mean_flat(wmap_lat * (target_high - eps_detail_lat) ** 2)
             else:
-                loss_base = mean_flat((1 - time_weight) * (target - eps_base_lat) ** 2)
-                loss_detail = mean_flat(time_weight * (target - eps_detail_lat) ** 2)
-                mse_raw = loss_base + loss_detail
-
-            terms["mse"] = mse_raw + reg_weight * reg + freq_reg_weight * freq_reg
+                loss_base = mean_flat((target_low - eps_base_lat) ** 2)
+                loss_detail = mean_flat((target_high - eps_detail_lat) ** 2)
+            mse_raw = loss_base + loss_detail
+            terms["mse"] = mse_raw
             if self.model_mean_type == ModelMeanType.EPSILON_SCALE:
-                terms["mse"] /= (self.kappa**2 * _extract_into_tensor(self.etas, t, (t.shape[0],1,1,1)))
+                terms["mse"] /= (self.kappa**2 * _extract_into_tensor(self.etas, t, (t.shape[0], 1, 1, 1)))
             if self.loss_type == LossType.WEIGHTED_MSE:
                 weights = _extract_into_tensor(self.weight_loss_mse, t, t.shape)
             else:
                 weights = 1
             terms["loss"] = terms["mse"] * weights
 
-        # 预测x0
+        # 预测 x0
         if self.model_mean_type == ModelMeanType.START_X:
             pred_xstart = model_output_lat
         elif self.model_mean_type == ModelMeanType.EPSILON:
@@ -717,9 +717,7 @@ class GaussianDiffusion:
             pred_xstart = self._predict_xstart_from_eps_scale(x_t=x_t, y=y, t=t, eps=model_output_lat.detach())
         else:
             raise NotImplementedError(self.model_mean_type)
-
         return terms, self.decode_first_stage(x_t), self.decode_first_stage(pred_xstart)
-
     def _scale_input(self, inputs, t):
         if self.normalize_input:
             # var_un = torch.sqrt(_extract_into_tensor(self.etas, t, inputs.shape) * (un.mean()**2 + un.std()**2) * self.kappa**2 + 0.5**2)
@@ -859,7 +857,6 @@ class GaussianDiffusion:
             with torch.no_grad():
                 wmap_init, _ = wm.weight_generator(raw_lr)
             wmap_init = torch.clamp(wmap_init, min=0.3, max=1.8)
-            wmap_init = F.interpolate(wmap_init, size=(64,64), mode="bilinear", align_corners=False)
             wm.current_weight = wmap_init
 
         x_sample = self.prior_sample(y, y_hat, noise, weight_manager=wm)
@@ -877,20 +874,19 @@ class GaussianDiffusion:
             if wm is not None:
                 step_t = t.float()
                 need_update, smooth_coeff = wm.get_update_info(step_t[0].item())
-                # 计算时序混合比例p(t)
                 p = self.calc_p(t)
-                # 原LR上采样到HR并编码到潜空间，与x_sample尺寸匹配
+        
+                # ✅ 在 RGB 空间混合
+                x_t_rgb = F.pixel_shuffle(x_sample, self.sf)  # 64×64×48 → 256×256×3
                 raw_lr_upsampled = F.interpolate(raw_lr, scale_factor=self.sf, mode="bicubic", align_corners=False)
-                raw_lr_lat = self.encode_first_stage(raw_lr_upsampled)
-                # 原LR(lat) + Xt(lat) 按p混合
-                mix_lat = p * x_sample + (1 - p) * raw_lr_lat
+                mix_rgb = p * x_t_rgb + (1 - p) * raw_lr_upsampled
+        
                 if need_update:
-                    wmap, _ = wm.update_weight(mix_lat, smooth_coeff, is_train=False)
+                    wmap, _ = wm.update_weight(mix_rgb, smooth_coeff, is_train=False)
                 else:
                     wmap = wm.current_weight
                 wmap = torch.clamp(wmap, min=0.3, max=1.8)
-                # 权重图扩充到与x_sample相同的通道数
-                wmap = wmap.repeat(1, x_sample.shape[1], 1, 1)
+                wmap = wmap.repeat(1, x_sample.shape[1], 1, 1) 
             with torch.no_grad():
                 # 将权重图传入模型，指导采样过程
                 if wm is not None:

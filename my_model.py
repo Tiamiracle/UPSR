@@ -43,22 +43,21 @@ class WeightGenerator(nn.Module):
             [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
         sobel_y = torch.tensor(
             [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        #算子改为卷积格式(out_channel, in_channel, k_h, k_w)，且不参与训练
         self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
         self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
-
         # 可学习参数α (全局标量，初始0.5)
         self.alpha = nn.Parameter(torch.tensor(0.5))
-        self.proj_48to1 = nn.Conv2d(48, 1, kernel_size=1, bias=False)
 
     def get_edge_map(self, x):
         """提取边缘图:输入(B, C, H, W)  输出边缘图edge_map: (B, 1, H, W) 范围[0, 1]亮的表示边缘"""
-        # 预处理
+        # 预处理（灰度化多通道压缩成单通道、池化）
         gray = x.mean(dim=1, keepdim=True)  # (B, 1, H, W)
         if gray.min() < 0:
             gray = (gray + 1) / 2
         gray = torch.clamp(gray, 0, 1)
         gray = F.avg_pool2d(gray, kernel_size=3, stride=1, padding=1)
-        # Sobel算梯度
+        # Sobel算梯度幅值（越大越是边缘）
         grad_x = F.conv2d(gray, self.sobel_x, padding=1)
         grad_y = F.conv2d(gray, self.sobel_y, padding=1)
         edge_map = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
@@ -76,7 +75,7 @@ class WeightGenerator(nn.Module):
         gray = torch.clamp(gray, 0, 1)
         gray = F.avg_pool2d(gray, kernel_size=3, stride=1, padding=1)
         B, C, H, W = gray.shape
-        # FFT处理
+        # FFT处理（）
         with torch.amp.autocast("cuda", enabled=False):
             gray_32 = gray.float()
             fft = torch.fft.fft2(gray_32, norm="ortho")
@@ -103,31 +102,28 @@ class WeightGenerator(nn.Module):
     def forward(self, x):
         """生成权重图输入: (B, C, H, W)输出weight_map: (B, 1, H, W)，范围[0,1]
         alpha: 可学习参数"""
-        if x.size(1) == 48:
-            feat = self.proj_48to1(x)
-            x = feat.repeat(1, 3, 1, 1)
         edge_map = self.get_edge_map(x)
         high_freq_map = self.get_high_freq_map(x)
 
         alpha = torch.clamp(torch.sigmoid(self.alpha), 0.1, 0.9)
-        # 加权融合+自适应归一化
+        # 加权融合
         weight_map = alpha * edge_map + (1 - alpha) * high_freq_map
         # 自适应归一化
         weight_map = weight_map / (weight_map.max(dim=2, keepdim=True)[0].max(dim=3, keepdim=True)[0] + 1e-6)
         weight_map = torch.clamp(weight_map, 0., 1.)
         return weight_map, alpha
 
-
 # ============ 动态权重管理器 ============
 class DynamicWeightManager:
-    def __init__(self, weight_generator, T=1000, total_iter=300000):
-        self.weight_generator = weight_generator
-        self.T = T
-        self.total_iter = total_iter
-        self.current_weight = None
-        self.update_counter = 0
-        self.first_update_done = False
-        self.training_iter = 0
+    def __init__(self, weight_generator, T=1000, total_iter=300000,sf=4):
+        self.weight_generator = weight_generator#权重提取器
+        self.T = T#时间步
+        self.sf = 4
+        self.total_iter = total_iter#总迭代次数
+        self.current_weight = None#当前权重
+        self.update_counter = 0#更新计数器
+        self.first_update_done = False#是否已首次更新
+        self.training_iter = 0#当前训练迭代次数
 
     def set_training_iter(self, training_iter):
         """设置当前训练迭代次数"""
@@ -189,6 +185,8 @@ class DynamicWeightManager:
         Returns:
             new_weight: 更新后的权重图 (B, 1, 64, 64)
         """
+        from torchvision.transforms import GaussianBlur
+        blend_img = GaussianBlur(kernel_size=3, sigma=0.5)(blend_img)
         if is_train:
             # 训练：去掉no_grad，允许梯度回传更新alpha
             new_weight, alpha = self.weight_generator(blend_img)
@@ -197,15 +195,13 @@ class DynamicWeightManager:
             with torch.no_grad():
                 new_weight, alpha = self.weight_generator(blend_img)
         # 指数平滑更新
-        new_weight = F.interpolate(new_weight, size=(64,64), mode="bilinear", align_corners=False)
+        new_weight_lat = F.avg_pool2d(new_weight, kernel_size=self.sf)
         if self.current_weight is None:
-            self.current_weight = new_weight
+            self.current_weight = new_weight_lat
         else:
-            self.current_weight = smoothing * self.current_weight + (1 - smoothing) * new_weight
+            self.current_weight = smoothing * self.current_weight + (1 - smoothing) * new_weight_lat
         # 值域截断到[0, 1]
         self.current_weight = torch.clamp(self.current_weight, 0.0, 1.0)
-        self.current_weight = F.interpolate(self.current_weight, size=(64,64), mode="bilinear", align_corners=False)
-
         return self.current_weight, alpha
 
     def reset(self, full_reset=False):
@@ -233,7 +229,8 @@ class UPSRRealModel(SRModel):
         self.weight_manager = DynamicWeightManager(
             self.weight_generator, 
             T=self.base_diffusion.num_timesteps,
-            total_iter=total_iter
+            total_iter=total_iter,
+            sf=self.opt['scale']
         )
         super(UPSRRealModel, self).__init__(opt)
         self.weight_generator = self.weight_generator.to(self.device)

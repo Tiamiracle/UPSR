@@ -899,9 +899,7 @@ class UNetModelSwin(nn.Module):
         h = self.lrelu(self.conv_up1(F.interpolate(h, scale_factor=2, mode='nearest')))
         h = self.lrelu(self.conv_up2(F.interpolate(h, scale_factor=2, mode='nearest')))
         feat = self.lrelu(self.conv_hr(h))
-        eps_base = self.head_base(feat)
-        eps_detail = self.head_detail(feat)
-        return eps_base, eps_detail
+        return self.head_base(feat)
 
     def convert_to_fp16(self):
         """
